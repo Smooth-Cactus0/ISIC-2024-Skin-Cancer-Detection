@@ -1,0 +1,55 @@
+# Data files (too large for git)
+/data/
+*.hdf5
+*.h5
+*.zip
+isic-2024-challenge/
+
+# Model outputs
+/outputs/
+*.pth
+*.pt
+*.pkl
+*.joblib
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info/
+.eggs/
+dist/
+build/
+
+# Jupyter
+.ipynb_checkpoints/
+*.ipynb_checkpoints
+
+# Environment
+.env
+.venv/
+venv/
+ENV/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+nul
+
+# Logs
+*.log
+wandb/
+
+# Internal project files (not for public repo)
+CLAUDE.md
+PROGRESS.md
+IMPLEMENTATION_PLAN.md
+.claude/
