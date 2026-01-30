@@ -1,0 +1,38 @@
+# Vision Transformer Training Configuration
+# Usage: python scripts/train_vit.py --config configs/vit_base.yaml
+
+# Data
+data_dir: "../isic-2024-challenge"
+output_dir: "../outputs/vit_base"
+
+# Model
+model_config: "vit_tiny"  # Start with tiny for quick experiments
+dropout: 0.2
+freeze_epochs: 2  # Freeze backbone for 2 epochs, then fine-tune
+
+# Training
+epochs: 20
+batch_size: 32
+accumulation_steps: 2  # Effective batch size = 64
+lr: 1.0e-3  # Learning rate for classifier head
+lr_backbone: 1.0e-5  # Lower LR for pretrained backbone
+weight_decay: 1.0e-4
+
+# Loss
+focal_alpha: 0.25  # Weight for positive class
+focal_gamma: 2.0   # Focusing parameter
+
+# Augmentation
+augmentation: "medium"  # Options: light, medium, heavy
+
+# Cross-validation
+n_folds: 5
+fold: null  # null = train all folds, or specify 0-4
+
+# System
+num_workers: 4
+seed: 42
+device: "cuda"
+fp16: true  # Mixed precision training
+wandb: false  # Weights & Biases logging
+use_sample: false  # Use small sample for testing

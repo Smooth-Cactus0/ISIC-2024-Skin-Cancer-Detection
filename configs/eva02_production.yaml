@@ -1,0 +1,39 @@
+# EVA02 Production Configuration
+# High-performance setup based on top Kaggle solutions
+# Usage: python scripts/train_vit.py --config configs/eva02_production.yaml
+
+# Data
+data_dir: "../isic-2024-challenge"
+output_dir: "../outputs/eva02_production"
+
+# Model
+model_config: "eva02_base"  # EVA02 Base (used by 1st/2nd place)
+dropout: 0.3
+freeze_epochs: 3
+
+# Training
+epochs: 30
+batch_size: 24  # Reduced for EVA02 (larger model)
+accumulation_steps: 3  # Effective batch size = 72
+lr: 5.0e-4
+lr_backbone: 1.0e-5
+weight_decay: 1.0e-4
+
+# Loss
+focal_alpha: 0.25
+focal_gamma: 2.0
+
+# Augmentation
+augmentation: "medium"
+
+# Cross-validation
+n_folds: 5
+fold: null
+
+# System
+num_workers: 6
+seed: 42
+device: "cuda"
+fp16: true
+wandb: false
+use_sample: false
