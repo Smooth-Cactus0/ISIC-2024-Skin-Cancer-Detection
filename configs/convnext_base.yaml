@@ -1,0 +1,38 @@
+# ConvNeXt Training Configuration
+# Usage: python scripts/train_convnext.py --config configs/convnext_base.yaml
+
+# Data
+data_dir: "../isic-2024-challenge"
+output_dir: "../outputs/convnext_nano"
+
+# Model
+model_config: "convnextv2_nano"  # Nano used in 3rd place solution
+dropout: 0.2
+drop_path_rate: 0.1  # Stochastic depth (regularization)
+freeze_epochs: 2
+
+# Training
+epochs: 20
+batch_size: 32
+accumulation_steps: 2
+lr: 1.0e-3
+lr_backbone: 1.0e-5
+weight_decay: 1.0e-4
+
+# Loss
+focal_alpha: 0.25
+focal_gamma: 2.0
+
+# Augmentation
+augmentation: "medium"
+
+# Cross-validation
+n_folds: 5
+fold: null
+
+# System
+num_workers: 4
+seed: 42
+device: "cuda"
+fp16: true
+use_sample: false
