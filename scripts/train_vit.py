@@ -272,7 +272,9 @@ def train_fold(
 
     train_loader = DataLoader(
         train_dataset,
-        batch_sampler=train_sampler,
+        sampler=train_sampler,
+        batch_size=args.batch_size,
+        drop_last=True,
         num_workers=args.num_workers,
         pin_memory=True
     )

@@ -398,7 +398,9 @@ def train_fold(fold, df_train, config):
 
     train_loader = DataLoader(
         train_dataset,
-        batch_sampler=train_sampler,
+        sampler=train_sampler,
+        batch_size=config.batch_size,
+        drop_last=True,
         num_workers=config.num_workers,
         pin_memory=True
     )
