@@ -221,10 +221,10 @@ class BalancedBatchSampler:
             batch_indices = np.concatenate([pos_batch, neg_batch])
             np.random.shuffle(batch_indices)
 
-            yield batch_indices.tolist()
+            yield from batch_indices.tolist()
 
     def __len__(self) -> int:
-        return self.n_batches
+        return self.n_batches * self.batch_size
 
 
 def create_fold_splits(

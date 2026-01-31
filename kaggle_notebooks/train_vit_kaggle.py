@@ -7,10 +7,12 @@ All dependencies are included inline (no external imports from src/).
 Usage in Kaggle:
 1. Create new notebook
 2. Copy this entire file into a code cell
-3. Run the cell
-4. Model will train and save checkpoints
+3. Set `Config.folds` to choose which folds to train
+4. Run the cell
 
-Expected runtime: 8-12 hours on Kaggle P100 GPU
+Recommended workflow (2 sessions to fit within Kaggle's 12h limit):
+  Session 1: Set folds = [0, 1, 2] → ~7h on P100
+  Session 2: Set folds = [3, 4]    → ~5h on P100
 """
 
 # ============================================================================
@@ -70,8 +72,10 @@ class Config:
 
     # Training
     n_folds = 5
-    fold = None  # None = train all folds
-    epochs = 20
+    folds = [0, 1, 2]  # Which folds to train this session
+    # Session 1: folds = [0, 1, 2]  (~7h on P100)
+    # Session 2: folds = [3, 4]     (~5h on P100)
+    epochs = 15
     batch_size = 24
     accumulation_steps = 3  # Effective batch = 72
     lr = 5e-4
@@ -286,10 +290,10 @@ class BalancedBatchSampler:
             batch_indices = np.concatenate([pos_batch, neg_batch])
             np.random.shuffle(batch_indices)
 
-            yield batch_indices.tolist()
+            yield from batch_indices.tolist()
 
     def __len__(self):
-        return self.n_batches
+        return self.n_batches * self.batch_size
 
 
 # ============================================================================
@@ -532,14 +536,12 @@ def main():
 
     # Train folds
     all_results = []
+    folds_to_train = config.folds if config.folds is not None else list(range(config.n_folds))
+    print(f"Training folds: {folds_to_train}")
 
-    if config.fold is not None:
-        results = train_fold(config.fold, df_train, config)
+    for fold in folds_to_train:
+        results = train_fold(fold, df_train, config)
         all_results.append(results)
-    else:
-        for fold in range(config.n_folds):
-            results = train_fold(fold, df_train, config)
-            all_results.append(results)
 
     # Summary
     print("\n" + "="*80)
