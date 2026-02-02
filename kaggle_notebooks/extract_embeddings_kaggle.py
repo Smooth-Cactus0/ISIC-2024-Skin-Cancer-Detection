@@ -14,25 +14,25 @@ Usage:
 Expected output:
 - train_embeddings.npy: (N_train, embedding_dim) embeddings
 - train_predictions.npy: (N_train,) out-of-fold predictions
-- test_embeddings.npy: (N_test, embedding_dim) embeddings
-- test_predictions.npy: (N_test,) averaged predictions
+- test_embeddings.npy: (N_test, embedding_dim) embeddings  [only during submission]
+- test_predictions.npy: (N_test,) averaged predictions      [only during submission]
 """
 
 import os
 from pathlib import Path
-from typing import Tuple, Dict
+from typing import Tuple, Dict, Optional
 
 import numpy as np
 import pandas as pd
 import torch
 import torch.nn as nn
 from torch.utils.data import Dataset, DataLoader
-from torch.cuda.amp import autocast
 import timm
 import albumentations as A
 from albumentations.pytorch import ToTensorV2
 from tqdm.auto import tqdm
 import cv2
+from sklearn.model_selection import StratifiedGroupKFold
 
 # ============================================================================
 # Configuration
@@ -48,12 +48,17 @@ class Config:
     train_images = f'{data_dir}/train-image/image'
     test_images = f'{data_dir}/test-image/image'
 
-    # Model weights directory - upload trained models as Kaggle dataset
-    model_dir = '/kaggle/input/trained-models'  # MODIFY THIS
+    # Model weights directories - upload trained models as Kaggle datasets
+    # Each model type points to its own uploaded dataset
+    model_dirs = {
+        'convnext': '/kaggle/input/isic-train-convnext',
+        'eva02': '/kaggle/input/isic-train-vit',       # UPDATE after ViT training
+        'vit': '/kaggle/input/isic-train-vit',          # UPDATE after ViT training
+    }
 
-    # Model architecture
-    # Options: 'vit', 'eva02', 'convnext'
-    model_type = 'eva02'  # MODIFY THIS
+    # Model architecture - CHANGE THIS to switch models
+    # Options: 'convnext', 'eva02', 'vit'
+    model_type = 'convnext'
 
     # Corresponding model name
     model_configs = {
@@ -71,8 +76,9 @@ class Config:
     num_workers = 2
     fp16 = True
 
-    # Cross-validation
+    # Cross-validation (must match training scripts)
     n_folds = 5
+    seed = 42
 
 
 # ============================================================================
@@ -105,7 +111,13 @@ class ISICDataset(Dataset):
         # Load image
         img_path = os.path.join(self.image_dir, f"{row['isic_id']}.jpg")
         image = cv2.imread(img_path)
-        image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+
+        if image is None:
+            # Return a black placeholder image if file is missing
+            image = np.zeros((self.transform.transforms[0].height,
+                              self.transform.transforms[0].width, 3), dtype=np.uint8)
+        else:
+            image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
 
         # Apply transforms
         image = self.transform(image=image)['image']
@@ -136,6 +148,12 @@ class ViTClassifier(nn.Module):
         """Extract embeddings without classification head"""
         return self.backbone(x)
 
+    def predict_from_embeddings(self, embeddings: torch.Tensor) -> torch.Tensor:
+        """Get predictions from pre-computed embeddings (avoids double forward pass)"""
+        features = self.dropout(embeddings)
+        logits = self.head(features)
+        return logits.squeeze(-1)
+
 
 class ConvNeXtClassifier(nn.Module):
     """ConvNeXt classifier"""
@@ -158,6 +176,12 @@ class ConvNeXtClassifier(nn.Module):
         """Extract embeddings without classification head"""
         return self.backbone(x)
 
+    def predict_from_embeddings(self, embeddings: torch.Tensor) -> torch.Tensor:
+        """Get predictions from pre-computed embeddings (avoids double forward pass)"""
+        features = self.dropout(embeddings)
+        logits = self.head(features)
+        return logits.squeeze(-1)
+
 
 def create_model(model_name: str, model_type: str) -> nn.Module:
     """Create model based on type"""
@@ -167,6 +191,19 @@ def create_model(model_name: str, model_type: str) -> nn.Module:
         return ConvNeXtClassifier(model_name)
     else:
         raise ValueError(f"Unknown model type: {model_type}")
+
+
+# ============================================================================
+# Checkpoint Loading
+# ============================================================================
+
+def find_checkpoint(model_dir: str, fold: int) -> Optional[Path]:
+    """Find checkpoint file, trying multiple directory layouts."""
+    for subdir in ['', 'outputs']:
+        candidate = Path(model_dir) / subdir / f'fold_{fold}' / 'best_model.pth'
+        if candidate.exists():
+            return candidate
+    return None
 
 
 # ============================================================================
@@ -182,6 +219,8 @@ def extract_embeddings_from_loader(
 ) -> Tuple[np.ndarray, np.ndarray, list]:
     """
     Extract embeddings and predictions from a dataloader.
+    Uses single forward pass through backbone, then computes predictions
+    from embeddings to avoid redundant computation.
 
     Returns:
         embeddings: (N, embedding_dim) feature vectors
@@ -197,16 +236,15 @@ def extract_embeddings_from_loader(
     for images, ids in tqdm(loader, desc='Extracting'):
         images = images.to(device)
 
-        with autocast(enabled=fp16):
-            # Get embeddings
+        with torch.amp.autocast('cuda', enabled=fp16 and device.type == 'cuda'):
+            # Single forward pass through backbone
             embeddings = model.get_embeddings(images)
-
-            # Get predictions
-            logits = model(images)
+            # Reuse embeddings for predictions (no second backbone pass)
+            logits = model.predict_from_embeddings(embeddings)
             predictions = torch.sigmoid(logits)
 
-        all_embeddings.append(embeddings.cpu().numpy())
-        all_predictions.append(predictions.cpu().numpy())
+        all_embeddings.append(embeddings.float().cpu().numpy())
+        all_predictions.append(predictions.float().cpu().numpy())
         all_ids.extend(ids)
 
     # Concatenate all batches
@@ -219,7 +257,7 @@ def extract_embeddings_from_loader(
 def extract_train_embeddings(
     df: pd.DataFrame,
     config: Config
-) -> Tuple[np.ndarray, np.ndarray]:
+) -> Tuple[Optional[np.ndarray], np.ndarray]:
     """
     Extract train embeddings using out-of-fold predictions.
 
@@ -231,9 +269,9 @@ def extract_train_embeddings(
 
     # Initialize arrays
     n_samples = len(df)
-    embedding_dim = None  # Will be determined from first batch
     all_embeddings = None
     all_predictions = np.zeros(n_samples)
+    folds_loaded = 0
 
     print("\nExtracting train embeddings (out-of-fold)...")
 
@@ -260,21 +298,21 @@ def extract_train_embeddings(
             config.model_type
         ).to(device)
 
-        checkpoint_path = Path(config.model_dir) / f'fold_{fold}' / 'best_model.pth'
-        if not checkpoint_path.exists():
-            print(f"WARNING: Checkpoint not found: {checkpoint_path}")
+        checkpoint_path = find_checkpoint(config.model_dir, fold)
+        if checkpoint_path is None:
+            print(f"WARNING: Checkpoint not found for fold {fold} in {config.model_dir}")
             continue
 
-        checkpoint = torch.load(checkpoint_path, map_location=device)
+        checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
         model.load_state_dict(checkpoint['model_state_dict'])
-        print(f"Loaded checkpoint (pAUC: {checkpoint['best_pauc']:.4f})")
+        print(f"Loaded: {checkpoint_path.name} (pAUC: {checkpoint['best_pauc']:.4f})")
 
         # Extract embeddings and predictions
         embeddings, predictions, ids = extract_embeddings_from_loader(
             model, loader, device, config.fp16
         )
 
-        # Initialize embedding array on first fold
+        # Initialize embedding array on first successful fold
         if all_embeddings is None:
             embedding_dim = embeddings.shape[1]
             all_embeddings = np.zeros((n_samples, embedding_dim), dtype=np.float32)
@@ -284,18 +322,24 @@ def extract_train_embeddings(
         val_indices = df[df['fold'] == fold].index
         all_embeddings[val_indices] = embeddings
         all_predictions[val_indices] = predictions
+        folds_loaded += 1
 
         # Clean up
         del model
         torch.cuda.empty_cache()
 
+    if folds_loaded == 0:
+        print("\nERROR: No checkpoints were loaded! Check model_dir paths.")
+        return None, all_predictions
+
+    print(f"\nSuccessfully extracted from {folds_loaded}/{config.n_folds} folds.")
     return all_embeddings, all_predictions
 
 
 def extract_test_embeddings(
     df: pd.DataFrame,
     config: Config
-) -> Tuple[np.ndarray, np.ndarray]:
+) -> Tuple[Optional[np.ndarray], np.ndarray]:
     """
     Extract test embeddings by averaging predictions from all folds.
 
@@ -316,9 +360,9 @@ def extract_test_embeddings(
 
     # Initialize accumulators
     n_samples = len(df)
-    embedding_dim = None
     all_embeddings_sum = None
     all_predictions_sum = np.zeros(n_samples)
+    folds_loaded = 0
 
     print("\nExtracting test embeddings (averaging all folds)...")
 
@@ -331,14 +375,14 @@ def extract_test_embeddings(
             config.model_type
         ).to(device)
 
-        checkpoint_path = Path(config.model_dir) / f'fold_{fold}' / 'best_model.pth'
-        if not checkpoint_path.exists():
-            print(f"WARNING: Checkpoint not found: {checkpoint_path}")
+        checkpoint_path = find_checkpoint(config.model_dir, fold)
+        if checkpoint_path is None:
+            print(f"WARNING: Checkpoint not found for fold {fold} in {config.model_dir}")
             continue
 
-        checkpoint = torch.load(checkpoint_path, map_location=device)
+        checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
         model.load_state_dict(checkpoint['model_state_dict'])
-        print(f"Loaded checkpoint (pAUC: {checkpoint['best_pauc']:.4f})")
+        print(f"Loaded: {checkpoint_path.name} (pAUC: {checkpoint['best_pauc']:.4f})")
 
         # Extract embeddings and predictions
         embeddings, predictions, _ = extract_embeddings_from_loader(
@@ -354,14 +398,19 @@ def extract_test_embeddings(
         # Accumulate
         all_embeddings_sum += embeddings
         all_predictions_sum += predictions
+        folds_loaded += 1
 
         # Clean up
         del model
         torch.cuda.empty_cache()
 
-    # Average across folds
-    all_embeddings = all_embeddings_sum / config.n_folds
-    all_predictions = all_predictions_sum / config.n_folds
+    if folds_loaded == 0:
+        print("\nERROR: No checkpoints loaded for test extraction!")
+        return None, all_predictions_sum
+
+    # Average across loaded folds
+    all_embeddings = all_embeddings_sum / folds_loaded
+    all_predictions = all_predictions_sum / folds_loaded
 
     return all_embeddings, all_predictions
 
@@ -374,13 +423,35 @@ def main():
     """Main extraction function"""
     config = Config()
 
+    # Resolve model directory from dict
+    config.model_dir = config.model_dirs[config.model_type]
+
     print("="*80)
     print("ISIC 2024 - Embedding Extraction")
     print("="*80)
     print(f"Model type: {config.model_type}")
     print(f"Model name: {config.model_configs[config.model_type]}")
     print(f"Model dir: {config.model_dir}")
-    print(f"Device: {'cuda' if torch.cuda.is_available() else 'cpu'}")
+    device = 'cuda' if torch.cuda.is_available() else 'cpu'
+    print(f"Device: {device}")
+
+    # Disable FP16 on CPU (autocast only works with CUDA)
+    if device == 'cpu' and config.fp16:
+        print("WARNING: FP16 disabled (requires CUDA). Using FP32.")
+        print("TIP: Enable GPU accelerator in Kaggle notebook settings.")
+        config.fp16 = False
+
+    # Verify model dir exists and show checkpoints
+    model_path = Path(config.model_dir)
+    if not model_path.exists():
+        print(f"\nERROR: Model directory not found: {config.model_dir}")
+        print("Make sure you've added the trained model as an input dataset.")
+        return
+
+    checkpoints = sorted(model_path.rglob('*.pth'))
+    print(f"\nFound {len(checkpoints)} checkpoint(s):")
+    for cp in checkpoints:
+        print(f"  {cp}")
 
     # Create output directory
     output_dir = Path(config.output_dir)
@@ -388,49 +459,95 @@ def main():
 
     # Load metadata
     print("\nLoading metadata...")
-    train_df = pd.read_csv(config.train_csv)
-    test_df = pd.read_csv(config.test_csv)
+    train_df = pd.read_csv(config.train_csv, low_memory=False)
+    test_df = pd.read_csv(config.test_csv, low_memory=False)
 
     print(f"Train samples: {len(train_df)}")
     print(f"Test samples: {len(test_df)}")
 
-    # Check for fold column
+    # Create fold column (reproducing exact same splits used during training)
     if 'fold' not in train_df.columns:
-        print("\nWARNING: 'fold' column not found in train metadata!")
-        print("You need to add cross-validation folds first.")
-        print("Use StratifiedGroupKFold with patient_id as groups.")
-        return
+        print("\nCreating cross-validation folds (seed=42, same as training)...")
+        train_df['fold'] = -1
+        sgkf = StratifiedGroupKFold(
+            n_splits=config.n_folds, shuffle=True, random_state=config.seed
+        )
+        for fold, (_, val_idx) in enumerate(
+            sgkf.split(train_df, train_df['target'], train_df['patient_id'])
+        ):
+            train_df.loc[val_idx, 'fold'] = fold
 
-    # Extract train embeddings (out-of-fold)
+        for f in range(config.n_folds):
+            n = (train_df['fold'] == f).sum()
+            pos = train_df.loc[train_df['fold'] == f, 'target'].sum()
+            print(f"  Fold {f}: {n:,} samples ({pos} malignant)")
+    else:
+        print("\nUsing existing fold assignments from metadata.")
+
+    # ====================================================================
+    # Extract TRAIN embeddings (out-of-fold)
+    # ====================================================================
     train_embeddings, train_predictions = extract_train_embeddings(train_df, config)
 
-    # Save train outputs
-    print("\nSaving train outputs...")
-    np.save(output_dir / 'train_embeddings.npy', train_embeddings)
-    np.save(output_dir / 'train_predictions.npy', train_predictions)
-    np.save(output_dir / 'train_ids.npy', train_df['isic_id'].values)
-    print(f"Saved: train_embeddings.npy {train_embeddings.shape}")
-    print(f"Saved: train_predictions.npy {train_predictions.shape}")
+    if train_embeddings is not None:
+        print("\nSaving train outputs...")
+        np.save(output_dir / 'train_embeddings.npy', train_embeddings)
+        np.save(output_dir / 'train_predictions.npy', train_predictions)
+        np.save(output_dir / 'train_ids.npy', train_df['isic_id'].values)
+        np.save(output_dir / 'train_targets.npy', train_df['target'].values)
+        print(f"  train_embeddings.npy  {train_embeddings.shape}")
+        print(f"  train_predictions.npy {train_predictions.shape}")
+        print(f"  train_ids.npy         ({len(train_df)},)")
+        print(f"  train_targets.npy     ({len(train_df)},)")
+    else:
+        print("\nERROR: Train embedding extraction failed. No outputs saved.")
+        return
 
-    # Extract test embeddings (averaged across folds)
-    test_embeddings, test_predictions = extract_test_embeddings(test_df, config)
+    # ====================================================================
+    # Extract TEST embeddings (only if test images exist on disk)
+    # ====================================================================
+    test_image_dir = Path(config.test_images)
+    # Check if test images actually exist (they only exist during Kaggle submission)
+    test_images_available = (
+        test_image_dir.exists()
+        and len(test_df) > 0
+        and any(test_image_dir.glob('*.jpg'))
+    )
 
-    # Save test outputs
-    print("\nSaving test outputs...")
-    np.save(output_dir / 'test_embeddings.npy', test_embeddings)
-    np.save(output_dir / 'test_predictions.npy', test_predictions)
-    np.save(output_dir / 'test_ids.npy', test_df['isic_id'].values)
-    print(f"Saved: test_embeddings.npy {test_embeddings.shape}")
-    print(f"Saved: test_predictions.npy {test_predictions.shape}")
+    if test_images_available:
+        print(f"\nTest images found at {config.test_images}")
+        test_embeddings, test_predictions = extract_test_embeddings(test_df, config)
 
+        if test_embeddings is not None:
+            print("\nSaving test outputs...")
+            np.save(output_dir / 'test_embeddings.npy', test_embeddings)
+            np.save(output_dir / 'test_predictions.npy', test_predictions)
+            np.save(output_dir / 'test_ids.npy', test_df['isic_id'].values)
+            print(f"  test_embeddings.npy  {test_embeddings.shape}")
+            print(f"  test_predictions.npy {test_predictions.shape}")
+    else:
+        print(f"\nSkipping test extraction — test images not found at {config.test_images}")
+        print("(This is normal during development. Test images are only available during submission.)")
+
+    # ====================================================================
+    # Summary
+    # ====================================================================
     print("\n" + "="*80)
     print("EXTRACTION COMPLETE")
     print("="*80)
     print(f"\nOutputs saved to: {output_dir}")
+    print(f"\nFiles:")
+    for f in sorted(output_dir.glob('*.npy')):
+        size_mb = f.stat().st_size / (1024 * 1024)
+        print(f"  {f.name}  ({size_mb:.1f} MB)")
+
     print("\nNext steps:")
-    print("1. Repeat for other model types (ViT, ConvNeXt)")
-    print("2. Combine embeddings with tabular features")
-    print("3. Train final GBDT ensemble")
+    if config.model_type == 'convnext':
+        print("1. Change model_type = 'eva02' and run again for ViT embeddings")
+    elif config.model_type in ['eva02', 'vit']:
+        print("1. Change model_type = 'convnext' and run again for ConvNeXt embeddings")
+    print("2. Upload embeddings as Kaggle dataset")
+    print("3. Run ensemble_kaggle.py to train final GBDT")
 
 
 if __name__ == '__main__':
